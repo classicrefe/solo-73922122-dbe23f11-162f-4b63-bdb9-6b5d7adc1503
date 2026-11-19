@@ -1,0 +1,3 @@
+payment_id,revision_id,account_id,occurred_at_utc,visible_at_utc,amount_cents,revoked
+p1,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,7777,false
+p9,1,acct-A,2026-11-15T11:30:00Z,2026-11-15T11:00:00Z,100,false

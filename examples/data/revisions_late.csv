@@ -1,0 +1,6 @@
+payment_id,revision_id,account_id,occurred_at_utc,visible_at_utc,amount_cents,revoked
+p1,2,acct-C,2026-11-15T11:00:00Z,2026-11-15T13:00:00Z,1000,false
+p4,2,acct-A,2026-11-15T10:00:00Z,2026-11-15T13:00:00Z,300,true
+p2,2,acct-A,2026-11-15T07:00:00Z,2026-11-15T13:00:00Z,5000,false
+p5,1,acct-A,2026-11-15T09:00:00Z,2026-11-15T13:00:00Z,250,false
+p6,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T07:00:00Z,999,false

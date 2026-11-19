@@ -1,0 +1,4 @@
+sample_id,account_id,prediction_at_utc
+s3,acct-A,2026-11-15T14:00:00Z
+s4,acct-C,2026-11-15T14:00:00Z
+s5,acct-A,2026-11-15T12:00:00Z
