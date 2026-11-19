@@ -6,7 +6,12 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.csvio import CsvError, parse_revision_csv, parse_sample_csv
+from app.csvio import (
+    CsvError,
+    parse_revision_csv,
+    parse_revision_records,
+    parse_sample_csv,
+)
 
 REV_HEADER = (
     "payment_id,revision_id,account_id,occurred_at_utc,visible_at_utc,"
@@ -80,6 +85,63 @@ class RevisionCsvTest(unittest.TestCase):
     def test_negative_revision_id_rejected(self):
         with self.assertRaisesRegex(CsvError, ">= 0"):
             parse_revision_csv(REV_HEADER + REV_ROW.replace("p1,1,", "p1,-1,"))
+
+
+class RevisionRecordsTest(unittest.TestCase):
+    """parse_revision_records: keeps exact source lines, never raises on
+    in-file key conflicts (that is the importer's job), still raises
+    CsvError on any field-format problem."""
+
+    def test_source_and_line_numbers_captured(self):
+        row2 = REV_ROW.replace("p1", "p2")
+        recs = parse_revision_records(REV_HEADER + REV_ROW + row2)
+        self.assertEqual(len(recs), 2)
+        self.assertEqual(recs[0].source, REV_ROW)
+        self.assertEqual(recs[1].source, row2)
+        self.assertEqual((recs[0].line_no, recs[1].line_no), (2, 3))
+        self.assertEqual(recs[1].row.payment_id, "p2")
+
+    def test_quoted_newline_source_spans_physical_lines(self):
+        row = 'p1,1,"acct\nA",2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,1000,false\n'
+        recs = parse_revision_records(REV_HEADER + row)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].source, row)
+        self.assertEqual(recs[0].row.account_id, "acct\nA")
+
+    def test_last_line_without_trailing_newline(self):
+        row = REV_ROW.rstrip("\n")
+        recs = parse_revision_records(REV_HEADER + row)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].source, row)
+
+    def test_blank_lines_skipped(self):
+        recs = parse_revision_records(REV_HEADER + "\n" + REV_ROW + "\n\n")
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].source, REV_ROW)
+        self.assertEqual(recs[0].line_no, 3)
+
+    def test_in_file_conflict_not_raised_by_parser(self):
+        recs = parse_revision_records(
+            REV_HEADER + REV_ROW + REV_ROW.replace(",1000,", ",1001,")
+        )
+        self.assertEqual(len(recs), 2)
+
+    def test_short_row_is_csv_error_not_crash(self):
+        short = REV_HEADER + "p1,1,acct-A\n"
+        with self.assertRaises(CsvError):
+            parse_revision_records(short)
+        with self.assertRaises(CsvError):
+            parse_revision_csv(short)
+        with self.assertRaises(CsvError):
+            parse_sample_csv("sample_id,account_id,prediction_at_utc\ns1\n")
+
+    def test_field_errors_still_rejected(self):
+        with self.assertRaisesRegex(CsvError, "integer"):
+            parse_revision_records(REV_HEADER + REV_ROW.replace("p1,1,", "p1,x,"))
+        with self.assertRaisesRegex(CsvError, "timezone"):
+            parse_revision_records(
+                REV_HEADER + REV_ROW.replace("2026-11-15T11:00:00Z", "2026-11-15")
+            )
 
 
 class SampleCsvTest(unittest.TestCase):

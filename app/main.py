@@ -11,17 +11,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
 
-from .csvio import CsvError, parse_revision_csv, parse_sample_csv
+from .csvio import CsvError, parse_revision_csv, parse_revision_records, parse_sample_csv
 from .db import create_pool, init_schema
 from .imports import (
     ACCEPTANCE_LOCK_KEY,
     ConflictError,
     import_revision_batch,
+    import_revision_reupload,
     import_sample_batch,
 )
 from .runner import RunWorker
@@ -43,6 +44,19 @@ class BatchResult(BaseModel):
     rows_total: int
     rows_inserted: int
     rows_reused: int
+
+
+class ReuploadReceipt(BaseModel):
+    batch_id: int
+    received_at: datetime
+    rows_total: int
+    rows_inserted: int
+    rows_reused: int
+    rows_rejected: int
+    rejected_payments: list[str]
+    conflicts: list[dict[str, Any]]
+    rejected_csv: str
+    rejected_csv_url: str
 
 
 class RunCreated(BaseModel):
@@ -197,6 +211,143 @@ async def upload_revision_batch(request: Request):
         rows_total=len(rows) + in_file_dups,
         rows_inserted=inserted,
         rows_reused=reused,
+    )
+
+
+# ------------------------------------------------------- revision re-uploads
+
+
+@app.post(
+    "/payment-revision-reuploads",
+    status_code=201,
+    response_model=ReuploadReceipt,
+    summary="Re-upload payment revisions with per-payment rejection",
+    description=(
+        "Same CSV format as `POST /payment-revision-batches`, but built for "
+        "channel correction re-uploads: malformed FIELDS still reject the "
+        "whole batch (400, nothing stored), while content conflicts only "
+        "reject the affected PAYMENT — all of its revisions in this batch — "
+        "and every other payment is inserted or reused as usual. A payment "
+        "is rejected when the file carries the same "
+        "`(payment_id, revision_id)` with different content, or when a "
+        "key's stored content differs. The response is the persisted "
+        "receipt: insert/reuse/reject counts, conflict keys, and "
+        "`rejected_csv` holding every source line of the rejected payments "
+        "for fixing and re-uploading (also downloadable at "
+        "`rejected_csv_url`). Revision rows and receipt commit atomically; "
+        "concurrent imports through either endpoint never half-store a "
+        "payment."
+    ),
+    openapi_extra=_UPLOAD_OPENAPI_EXTRA,
+)
+async def upload_revision_reupload(request: Request):
+    text = await _read_csv_body(request)
+    try:
+        records = parse_revision_records(text)
+    except CsvError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    pool = get_pool(request)
+    with pool.connection() as conn:
+        receipt = import_revision_reupload(conn, records)
+    return _receipt_response(receipt)
+
+
+def _receipt_response(receipt: dict[str, Any]) -> ReuploadReceipt:
+    return ReuploadReceipt(
+        **receipt,
+        rejected_csv_url=(
+            f"/payment-revision-reuploads/{receipt['batch_id']}/rejected.csv"
+        ),
+    )
+
+
+_REUPLOAD_COLS = (
+    "batch_id, received_at, rows_total, rows_inserted, rows_reused, "
+    "rows_rejected, rejected_payments, conflicts, rejected_csv"
+)
+
+
+def _fetch_reupload(pool: ConnectionPool, batch_id: int):
+    with pool.connection() as conn:
+        row = conn.execute(
+            f"SELECT {_REUPLOAD_COLS} FROM revision_reupload_batches "
+            "WHERE batch_id = %s",
+            (batch_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=404, detail=f"re-upload batch {batch_id} not found"
+        )
+    return row
+
+
+@app.get(
+    "/payment-revision-reuploads",
+    summary="List re-upload receipts",
+)
+def list_revision_reuploads(request: Request):
+    pool = get_pool(request)
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT batch_id, received_at, rows_total, rows_inserted, "
+            "rows_reused, rows_rejected, rejected_payments "
+            "FROM revision_reupload_batches ORDER BY batch_id"
+        ).fetchall()
+    return [
+        {
+            "batch_id": r[0],
+            "received_at": _utc(r[1]),
+            "rows_total": r[2],
+            "rows_inserted": r[3],
+            "rows_reused": r[4],
+            "rows_rejected": r[5],
+            "rejected_payments": r[6],
+        }
+        for r in rows
+    ]
+
+
+@app.get(
+    "/payment-revision-reuploads/{batch_id}",
+    response_model=ReuploadReceipt,
+    summary="Get a re-upload receipt by batch id",
+)
+def get_revision_reupload(batch_id: int, request: Request):
+    row = _fetch_reupload(get_pool(request), batch_id)
+    return _receipt_response(
+        {
+            "batch_id": row[0],
+            "received_at": row[1],
+            "rows_total": row[2],
+            "rows_inserted": row[3],
+            "rows_reused": row[4],
+            "rows_rejected": row[5],
+            "rejected_payments": row[6],
+            "conflicts": row[7],
+            "rejected_csv": row[8],
+        }
+    )
+
+
+@app.get(
+    "/payment-revision-reuploads/{batch_id}/rejected.csv",
+    summary="Download the correction CSV for a re-upload batch",
+    description=(
+        "Header plus the exact source lines of every rejected payment of "
+        "the batch, in original file order — fix the conflicting values "
+        "and re-upload this file as-is."
+    ),
+)
+def download_reupload_rejected_csv(batch_id: int, request: Request):
+    row = _fetch_reupload(get_pool(request), batch_id)
+    return Response(
+        content=row[8],
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="reupload_{batch_id}_rejected.csv"'
+            )
+        },
     )
 
 
@@ -445,6 +596,7 @@ def stats(request: Request):
             "payment_revisions",
             "samples",
             "revision_batches",
+            "revision_reupload_batches",
             "sample_batches",
             "training_runs",
             "run_results",
@@ -470,6 +622,10 @@ def root():
         "docs": "/docs",
         "endpoints": [
             "POST /payment-revision-batches",
+            "POST /payment-revision-reuploads",
+            "GET /payment-revision-reuploads",
+            "GET /payment-revision-reuploads/{batch_id}",
+            "GET /payment-revision-reuploads/{batch_id}/rejected.csv",
             "POST /sample-batches",
             "POST /training-runs",
             "GET /training-runs",

@@ -36,6 +36,21 @@ CREATE TABLE IF NOT EXISTS revision_batches (
     rows_reused   integer NOT NULL
 );
 
+-- Receipts of the re-upload endpoint (per-payment rejection). Written in
+-- the SAME transaction as the revision rows they describe, so an upload
+-- either leaves both its rows and its receipt or neither.
+CREATE TABLE IF NOT EXISTS revision_reupload_batches (
+    batch_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    received_at       timestamptz NOT NULL DEFAULT now(),
+    rows_total        integer NOT NULL,
+    rows_inserted     integer NOT NULL,
+    rows_reused       integer NOT NULL,
+    rows_rejected     integer NOT NULL,
+    rejected_payments jsonb NOT NULL,
+    conflicts         jsonb NOT NULL,
+    rejected_csv      text NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sample_batches (
     batch_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     accepted_at   timestamptz NOT NULL DEFAULT now(),

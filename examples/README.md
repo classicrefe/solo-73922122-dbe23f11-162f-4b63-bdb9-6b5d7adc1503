@@ -45,6 +45,22 @@ docker compose up -d --build
 
 提示：worker 默认很快，20000 样本可能几秒内跑完；用 `RUN_CHUNK_DELAY_MS=100 docker compose up -d` 让中断窗口清晰可见。若脚本提示"run completed before restart"，按此调整即可。
 
+## 04 · 渠道补传回执（`04_reupload_partial.sh`）
+
+新入口 `POST /payment-revision-reuploads` 与原入口接收同样的 CSV，但冲突处理改为**按支付拒收**：
+
+1. 先确保 `revisions_base.csv` 已入库（幂等复用）。
+2. 上传 `data/revisions_reupload.csv`：
+   - `p1#1` 金额与库内不符（7777 vs 1000）→ **p1 在本批的全部修订被拒收**（含新修订 `p1#3`）
+   - `p8#1` 文件内同键异值（250/260）→ **p8 全部拒收**
+   - `p7#1` 新键写入、`p2#1` 同内容复用——正常支付照常入库
+3. 按批次号查回执 `GET /payment-revision-reuploads/{batch_id}`：写入/复用/拒收数量、冲突键（含原因与双方内容）。
+4. 下载待修正 CSV `GET /payment-revision-reuploads/{batch_id}/rejected.csv`：保留被拒支付在本批的**全部源行**。
+5. 修正该 CSV（p1 金额改回 1000、p8 去掉冲突行）后重传 → 全部写入/复用。
+6. 原入口依旧整批拒绝（409），`p9` 不落库。
+
+字段格式错误（如时间戳非法）时两个入口都是**整批拒收**（400），且不留回执。
+
 ## 数据文件
 
 | 文件 | 内容 |
@@ -52,4 +68,5 @@ docker compose up -d --build
 | `data/revisions_base.csv` | 4 条基础修订（p1–p4，T 前可见） |
 | `data/revisions_late.csv` | 5 条迟到修订（更正账户/时刻、撤销、晚到、回填） |
 | `data/revisions_conflict.csv` | 与既有 `p1#1` 内容冲突的批次（含一条新行 p9，用于证明整批回滚） |
+| `data/revisions_reupload.csv` | 补传批次：p1 与库内冲突、p8 文件内冲突、p7 新增、p2 复用 |
 | `data/samples_1.csv` / `data/samples_2.csv` | 示例 01 的样本 |

@@ -27,6 +27,7 @@ curl localhost:8000/health        # {"status":"ok"}
 ```bash
 bash examples/01_late_corrections.sh     # 迟到更正 / 撤销 / 改账户 / 改时刻
 bash examples/02_concurrent_uploads.sh   # 运行中并发补传 + 幂等复用 + 整批拒绝
+bash examples/04_reupload_partial.sh     # 渠道补传：按支付拒收 + 回执 + 待修正 CSV
 RUN_CHUNK_DELAY_MS=100 docker compose up -d   # 放慢 worker 便于观察
 bash examples/03_restart_resume.sh       # 重启接续
 ```
@@ -60,6 +61,18 @@ s1,acct-A,2026-11-15T12:00:00Z
 - **同号异内容 → 整批拒绝**：`(payment_id, revision_id)`（或 `sample_id`）已存在且内容不同，则**整个批次回滚**（HTTP 409，响应列出冲突键），批内其他新行也不会落库。样本的幂等规则与修订一致。
 - 文件内重复行：内容相同则去重，内容冲突则整批 400。
 
+## 渠道补传：按支付部分拒收与回执
+
+`POST /payment-revision-reuploads` 接收**同一格式**的支付修订 CSV，供收单渠道补传订正：正常支付先入库，有问题的支付逐笔拿回明细订正。规则：
+
+- **字段格式有误 → 整批拒收**（400，不留回执），与原入口一致。
+- **同键异值 → 只拒收这笔支付**：同键指 `(payment_id, revision_id)` 均相同。文件内同键异值，或同键内容与库内不符时，该支付**在本批的全部修订**（含其它修订号）都不入库；其余支付仍按原规则写入或复用。
+- **回执按批次号可查**：`GET /payment-revision-reuploads/{batch_id}` 返回写入/复用/拒收数量、冲突键（含原因与双方内容）及待修正 CSV；`GET /payment-revision-reuploads/{batch_id}/rejected.csv` 直接下载该 CSV。CSV 保留每笔被拒支付在本批的**全部源行**（原顺序），渠道订正后可原样重传。
+- **原子性**：修订行与回执在同一事务提交，失败时两者都不留；某笔支付在本批已插入的行会随拒收回滚，新旧入口并发导入也不会只落一笔支付的部分修订。
+- 原入口 `POST /payment-revision-batches` 语义不变：整批受理或整批拒绝。
+
+演示：`bash examples/04_reupload_partial.sh`。
+
 ## 训练集生成语义
 
 - `POST /training-runs` 在**受理时点**冻结水位线：仅包含此前已提交的完整样本批次。运行期间上传的批次照常受理（201），但属于**下一次**运行。
@@ -73,8 +86,11 @@ s1,acct-A,2026-11-15T12:00:00Z
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/payment-revision-batches` | 导入支付修订 CSV（201 / 400 格式错 / 409 内容冲突） |
-| POST | `/sample-batches` | 导入预测样本 CSV（同上） |
+| POST | `/payment-revision-batches` | 导入支付修订 CSV（201 / 400 格式错 / 409 内容冲突，整批） |
+| POST | `/payment-revision-reuploads` | 渠道补传：按支付部分拒收，返回回执（201 / 400 格式错整批拒收） |
+| GET | `/payment-revision-reuploads`、`/payment-revision-reuploads/{id}` | 补传回执列表 / 按批次号查回执 |
+| GET | `/payment-revision-reuploads/{id}/rejected.csv` | 下载待修正 CSV（被拒支付的全部源行） |
+| POST | `/sample-batches` | 导入预测样本 CSV（同原修订入口规则） |
 | POST | `/training-runs` | 创建训练运行（201 / 409 已有活动运行） |
 | GET | `/training-runs` / `/training-runs/{id}` | 运行状态与进度 |
 | GET | `/training-runs/{id}/dataset.csv` | 下载特征数据集（完成前 409） |
@@ -102,7 +118,7 @@ TEST_ADMIN_URL=postgresql://app@127.0.0.1:5544/postgres \
 ```
 
 - `tests/test_csvio.py`：CSV 解析/校验单元测试（无需服务）。
-- `tests/test_e2e.py`：真实 PostgreSQL 上的端到端测试——窗口与可见性边界、撤销语义、账户/时刻更正、幂等复用、整批拒绝、水位线隔离、下载门槛、优雅重启与崩溃接续。
+- `tests/test_e2e.py`：真实 PostgreSQL 上的端到端测试——窗口与可见性边界、撤销语义、账户/时刻更正、幂等复用、整批拒绝、水位线隔离、下载门槛、优雅重启与崩溃接续；补传入口的按支付拒收、回执与待修正 CSV、新旧入口并发下的支付级原子性、入库与回执同事务。
 
 ## 设计说明与限制
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import threading
 import time
 import unittest
 
@@ -26,6 +27,13 @@ os.environ.setdefault("RUNNER_IDLE_SLEEP_MS", "100")
 import psycopg  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.csvio import parse_revision_csv, parse_revision_records  # noqa: E402
+from app.db import create_pool  # noqa: E402
+from app.imports import (  # noqa: E402
+    ConflictError,
+    import_revision_batch,
+    import_revision_reupload,
+)
 from app.main import app  # noqa: E402
 
 ADMIN_URL = os.environ.get("TEST_ADMIN_URL", "postgresql://app@127.0.0.1:5544/postgres")
@@ -265,6 +273,290 @@ class E2E(unittest.TestCase):
             self.assertEqual(len(rows), total)
             self.assertEqual(len({r["sample_id"] for r in rows}), total)  # no duplicates
             self.assertEqual(sum(r["sample_id"].startswith("rs-") for r in rows), 5000)
+
+
+class ReuploadE2E(unittest.TestCase):
+    """The re-upload endpoint: per-payment rejection, persisted receipts,
+    correction CSV, and atomicity against the original endpoint."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        make_db()
+
+    def _db_revision_rows(self) -> list[tuple]:
+        with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+            return conn.execute(
+                "SELECT payment_id, revision_id, amount_cents "
+                "FROM payment_revisions ORDER BY payment_id, revision_id"
+            ).fetchall()
+
+    def test_01_mixed_batch_rejects_only_conflicting_payments(self):
+        base = REV_HEADER + (
+            "ru-p1,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,1000,false\n"
+            "ru-p2,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,2000,false\n"
+        )
+        reup_lines = [
+            # db conflict: ru-p1#1 stored with amount 1000
+            "ru-p1,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,9999,false",
+            # same payment, different revision -> rejected together with it
+            "ru-p1,2,acct-A,2026-11-15T11:30:00Z,2026-11-15T11:20:00Z,1000,false",
+            # identical to the stored row -> reused
+            "ru-p2,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,2000,false",
+            # brand new -> inserted
+            "ru-p3,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,3000,false",
+            # in-file same key, different values -> whole payment rejected
+            "ru-p4,1,acct-A,2026-11-15T09:00:00Z,2026-11-15T09:30:00Z,400,false",
+            "ru-p4,1,acct-A,2026-11-15T09:00:00Z,2026-11-15T09:30:00Z,401,false",
+            "ru-p4,2,acct-A,2026-11-15T09:10:00Z,2026-11-15T09:40:00Z,400,false",
+        ]
+        with TestClient(app) as client:
+            r = post_csv(client, "/payment-revision-batches", base)
+            self.assertEqual(r.status_code, 201, r.text)
+
+            r = post_csv(client, "/payment-revision-reuploads",
+                         REV_HEADER + "\n".join(reup_lines) + "\n")
+            self.assertEqual(r.status_code, 201, r.text)
+            body = r.json()
+            self.assertEqual(body["rows_total"], 7)
+            self.assertEqual(body["rows_inserted"], 1)  # ru-p3#1
+            self.assertEqual(body["rows_reused"], 1)  # ru-p2#1
+            self.assertEqual(body["rows_rejected"], 5)  # ru-p1 x2 + ru-p4 x3
+            self.assertEqual(
+                body["rows_total"],
+                body["rows_inserted"] + body["rows_reused"] + body["rows_rejected"],
+            )
+            self.assertEqual(sorted(body["rejected_payments"]), ["ru-p1", "ru-p4"])
+            reasons = {c["key"]: c["reason"] for c in body["conflicts"]}
+            self.assertEqual(
+                reasons, {"ru-p1#1": "db_conflict", "ru-p4#1": "in_file_conflict"}
+            )
+            db_conflict = next(c for c in body["conflicts"] if c["reason"] == "db_conflict")
+            self.assertEqual(db_conflict["existing"]["amount_cents"], 1000)
+            self.assertEqual(db_conflict["incoming"]["amount_cents"], 9999)
+            batch_id = body["batch_id"]
+            self.assertEqual(
+                body["rejected_csv_url"],
+                f"/payment-revision-reuploads/{batch_id}/rejected.csv",
+            )
+
+            # receipt is persisted and queryable by batch id
+            g = client.get(f"/payment-revision-reuploads/{batch_id}")
+            self.assertEqual(g.status_code, 200, g.text)
+            self.assertEqual(g.json()["rows_rejected"], 5)
+            self.assertEqual(g.json()["conflicts"], body["conflicts"])
+            listing = client.get("/payment-revision-reuploads").json()
+            self.assertEqual([b["batch_id"] for b in listing], [batch_id])
+            self.assertEqual(listing[0]["rejected_payments"], ["ru-p1", "ru-p4"])
+
+            # correction CSV keeps ALL source lines of the rejected payments,
+            # in original file order, and matches the receipt's embedded copy
+            expected_csv = REV_HEADER + "\n".join(
+                reup_lines[i] for i in (0, 1, 4, 5, 6)
+            ) + "\n"
+            self.assertEqual(body["rejected_csv"], expected_csv)
+            c = client.get(f"/payment-revision-reuploads/{batch_id}/rejected.csv")
+            self.assertEqual(c.status_code, 200, c.text)
+            self.assertEqual(c.text, expected_csv)
+            type(self).rejected_csv_text = c.text
+
+            # good payments stored, rejected payments fully absent
+            self.assertEqual(
+                self._db_revision_rows(),
+                [
+                    ("ru-p1", 1, 1000),
+                    ("ru-p2", 1, 2000),
+                    ("ru-p3", 1, 3000),
+                ],
+            )
+
+    def test_02_format_error_rejects_whole_batch_and_leaves_no_receipt(self):
+        with TestClient(app) as client:
+            before = client.get("/payment-revision-reuploads").json()
+            stats_before = client.get("/stats").json()
+            bad = REV_HEADER + (
+                "fe-ok,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,5,false\n"
+                "fe-bad,1,acct-A,not-a-timestamp,2026-11-15T10:00:00Z,5,false\n"
+            )
+            r = post_csv(client, "/payment-revision-reuploads", bad)
+            self.assertEqual(r.status_code, 400, r.text)
+            # no receipt, no rows: the whole batch was rejected
+            self.assertEqual(client.get("/payment-revision-reuploads").json(), before)
+            self.assertEqual(client.get("/stats").json(), stats_before)
+
+    def test_03_correction_cycle_and_idempotent_reupload(self):
+        """Fix the rejected CSV from test_01, re-upload: accepted; the same
+        file again is fully reused. Unknown receipt ids are 404."""
+        rejected = self.rejected_csv_text.splitlines()
+        header, lines = rejected[0], rejected[1:]
+        fixed, seen_p4 = [], False
+        for line in lines:
+            if line.startswith("ru-p1,1,"):
+                line = line.replace(",9999,", ",1000,")  # match the stored row
+            if line.startswith("ru-p4,1,"):
+                if seen_p4:
+                    continue  # drop the conflicting duplicate
+                seen_p4 = True
+            fixed.append(line)
+        fixed_csv = header + "\n" + "\n".join(fixed) + "\n"
+        with TestClient(app) as client:
+            r = post_csv(client, "/payment-revision-reuploads", fixed_csv)
+            self.assertEqual(r.status_code, 201, r.text)
+            body = r.json()
+            self.assertEqual(
+                (body["rows_total"], body["rows_inserted"],
+                 body["rows_reused"], body["rows_rejected"]),
+                (4, 3, 1, 0),
+            )
+            self.assertEqual(body["rejected_payments"], [])
+            self.assertEqual(body["conflicts"], [])
+            self.assertEqual(body["rejected_csv"], REV_HEADER)
+
+            # identical re-upload -> everything reused
+            r2 = post_csv(client, "/payment-revision-reuploads", fixed_csv)
+            self.assertEqual(r2.status_code, 201, r2.text)
+            self.assertEqual(
+                (r2.json()["rows_inserted"], r2.json()["rows_reused"]), (0, 4)
+            )
+
+            self.assertEqual(
+                self._db_revision_rows(),
+                [
+                    ("ru-p1", 1, 1000),
+                    ("ru-p1", 2, 1000),
+                    ("ru-p2", 1, 2000),
+                    ("ru-p3", 1, 3000),
+                    ("ru-p4", 1, 400),
+                    ("ru-p4", 2, 400),
+                ],
+            )
+            self.assertEqual(
+                client.get("/payment-revision-reuploads/999999").status_code, 404
+            )
+            self.assertEqual(
+                client.get("/payment-revision-reuploads/999999/rejected.csv").status_code,
+                404,
+            )
+
+    def test_04_concurrent_legacy_and_reupload_never_split_a_payment(self):
+        """Race the two endpoints on the same payment: afterwards the
+        payment's rows come entirely from ONE of the batches — never a mix,
+        never a partial set."""
+        pool = create_pool(os.environ["DATABASE_URL"], max_size=4)
+        try:
+            with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+                receipts_before = conn.execute(
+                    "SELECT count(*) FROM revision_reupload_batches"
+                ).fetchone()[0]
+            for round_no in range(8):
+                pid = f"cc-{round_no}"
+                legacy_text = REV_HEADER + (
+                    f"{pid},1,acct-L,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,100,false\n"
+                    f"{pid},2,acct-L,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,200,false\n"
+                )
+                reup_text = REV_HEADER + (
+                    f"{pid},1,acct-R,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,999,false\n"
+                    f"{pid},3,acct-R,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,300,false\n"
+                )
+                rows, dups = parse_revision_csv(legacy_text)
+                records = parse_revision_records(reup_text)
+                barrier = threading.Barrier(2)
+                outcome: dict = {}
+
+                def run_legacy():
+                    try:
+                        with pool.connection() as conn:
+                            barrier.wait(timeout=10)
+                            import_revision_batch(conn, rows, dups)
+                        outcome["legacy"] = "accepted"
+                    except ConflictError:
+                        outcome["legacy"] = "rejected"
+                    except Exception as exc:  # pragma: no cover - failure aid
+                        outcome["legacy_error"] = exc
+
+                def run_reupload():
+                    try:
+                        with pool.connection() as conn:
+                            barrier.wait(timeout=10)
+                            outcome["receipt"] = import_revision_reupload(conn, records)
+                    except Exception as exc:  # pragma: no cover - failure aid
+                        outcome["reupload_error"] = exc
+
+                threads = [
+                    threading.Thread(target=run_legacy),
+                    threading.Thread(target=run_reupload),
+                ]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(30)
+                self.assertFalse(any(t.is_alive() for t in threads), "deadlock?")
+                self.assertNotIn("legacy_error", outcome, outcome)
+                self.assertNotIn("reupload_error", outcome, outcome)
+
+                with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+                    got = conn.execute(
+                        "SELECT revision_id, account_id, amount_cents "
+                        "FROM payment_revisions WHERE payment_id = %s "
+                        "ORDER BY revision_id",
+                        (pid,),
+                    ).fetchall()
+                legacy_state = [(1, "acct-L", 100), (2, "acct-L", 200)]
+                reupload_state = [(1, "acct-R", 999), (3, "acct-R", 300)]
+                self.assertIn(
+                    got,
+                    (legacy_state, reupload_state),
+                    f"payment {pid} split across concurrent batches: {got}",
+                )
+                receipt = outcome["receipt"]
+                if got == legacy_state:
+                    self.assertEqual(outcome["legacy"], "accepted")
+                    self.assertEqual(receipt["rows_inserted"], 0)
+                    self.assertEqual(receipt["rows_rejected"], 2)
+                    self.assertEqual(receipt["rejected_payments"], [pid])
+                else:
+                    self.assertEqual(outcome["legacy"], "rejected")
+                    self.assertEqual(receipt["rows_inserted"], 2)
+                    self.assertEqual(receipt["rows_rejected"], 0)
+            with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+                receipts_after = conn.execute(
+                    "SELECT count(*) FROM revision_reupload_batches"
+                ).fetchone()[0]
+            # every re-upload committed exactly one receipt, win or lose
+            self.assertEqual(receipts_after - receipts_before, 8)
+        finally:
+            pool.close()
+
+    def test_05_rows_and_receipt_commit_or_vanish_together(self):
+        """A failure after the import work but before commit leaves neither
+        revision rows nor a receipt behind."""
+        records = parse_revision_records(
+            REV_HEADER
+            + "atomic-p,1,acct-A,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,5,false\n"
+        )
+        pool = create_pool(os.environ["DATABASE_URL"], max_size=2)
+
+        class Boom(Exception):
+            pass
+
+        try:
+            with self.assertRaises(Boom):
+                with pool.connection() as conn:
+                    receipt = import_revision_reupload(conn, records)
+                    raise Boom  # simulate a failure just before commit
+            with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+                n_rows = conn.execute(
+                    "SELECT count(*) FROM payment_revisions "
+                    "WHERE payment_id = 'atomic-p'"
+                ).fetchone()[0]
+                n_receipts = conn.execute(
+                    "SELECT count(*) FROM revision_reupload_batches "
+                    "WHERE batch_id = %s",
+                    (receipt["batch_id"],),
+                ).fetchone()[0]
+            self.assertEqual(n_rows, 0)
+            self.assertEqual(n_receipts, 0)
+        finally:
+            pool.close()
 
 
 if __name__ == "__main__":

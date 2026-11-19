@@ -59,16 +59,37 @@ class SampleRow:
         return (self.account_id, self.prediction_at)
 
 
-def _parse_int(value: str, field: str, line: int) -> int:
-    v = value.strip()
+@dataclass(frozen=True)
+class RevisionRecord:
+    """A parsed revision row plus its exact source text.
+
+    The source text (which may span several physical lines when a quoted
+    field embeds newlines) is what the re-upload receipt hands back to the
+    channel in the correction CSV.
+    """
+
+    row: RevisionRow
+    line_no: int
+    source: str
+
+
+@dataclass(frozen=True)
+class _RawRecord:
+    line_no: int  # 1-based number of the record's last physical line
+    source: str  # exact source text of the record
+    fields: dict[str, "str | None"]  # header name -> raw value (None if short)
+
+
+def _parse_int(value: "str | None", field: str, line: int) -> int:
+    v = (value or "").strip()
     try:
         return int(v, 10)
     except ValueError:
         raise CsvError(f"line {line}: field '{field}' must be an integer, got {value!r}")
 
 
-def _parse_bool(value: str, field: str, line: int) -> bool:
-    v = value.strip().lower()
+def _parse_bool(value: "str | None", field: str, line: int) -> bool:
+    v = (value or "").strip().lower()
     if v in _TRUE_VALUES:
         return True
     if v in _FALSE_VALUES:
@@ -79,8 +100,8 @@ def _parse_bool(value: str, field: str, line: int) -> bool:
     )
 
 
-def _parse_ts(value: str, field: str, line: int) -> datetime:
-    v = value.strip()
+def _parse_ts(value: "str | None", field: str, line: int) -> datetime:
+    v = (value or "").strip()
     try:
         dt = datetime.fromisoformat(v)
     except ValueError:
@@ -95,25 +116,77 @@ def _parse_ts(value: str, field: str, line: int) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _parse_text(value: str | None, field: str, line: int) -> str:
+def _parse_text(value: "str | None", field: str, line: int) -> str:
     v = (value or "").strip()
     if not v:
         raise CsvError(f"line {line}: field '{field}' must not be empty")
     return v
 
 
-def _reader(text: str, required: list[str]) -> csv.DictReader:
-    reader = csv.DictReader(io.StringIO(text))
-    if reader.fieldnames is None:
+def _read_records(text: str, required: list[str]) -> list[_RawRecord]:
+    """Split the CSV into records, keeping each record's exact source text.
+
+    Header names are matched after stripping surrounding whitespace. Blank
+    lines are skipped (csv.DictReader semantics). Short rows yield None for
+    the missing fields so the field parsers raise a clean CsvError instead
+    of crashing.
+    """
+    stream = io.StringIO(text)
+    reader = csv.reader(stream)
+    try:
+        header = next(reader)
+    except StopIteration:
         raise CsvError("empty CSV: header row is required")
-    fields = [f.strip() for f in reader.fieldnames]
-    missing = [c for c in required if c not in fields]
+    pos = stream.tell()
+    names = [f.strip() for f in header]
+    missing = [c for c in required if c not in names]
     if missing:
         raise CsvError(
             f"missing required column(s): {', '.join(missing)}; "
             f"expected columns: {', '.join(required)}"
         )
-    return reader
+    index: dict[str, int] = {}
+    for i, name in enumerate(names):
+        index[name] = i  # a duplicated header name maps to its last column
+    records: list[_RawRecord] = []
+    for rec in reader:
+        cur = stream.tell()
+        source = text[pos:cur]
+        pos = cur
+        if not rec:
+            continue  # blank line
+        fields = {
+            name: (rec[i] if i < len(rec) else None) for name, i in index.items()
+        }
+        records.append(_RawRecord(line_no=reader.line_num, source=source, fields=fields))
+    return records
+
+
+def _revision_row(fields: dict[str, "str | None"], line: int) -> RevisionRow:
+    payment_id = _parse_text(fields.get("payment_id"), "payment_id", line)
+    revision_id = _parse_int(fields.get("revision_id"), "revision_id", line)
+    if revision_id < 0:
+        raise CsvError(f"line {line}: field 'revision_id' must be >= 0")
+    amount_cents = _parse_int(fields.get("amount_cents"), "amount_cents", line)
+    if not (_INT64_MIN <= amount_cents <= _INT64_MAX):
+        raise CsvError(f"line {line}: field 'amount_cents' out of int64 range")
+    return RevisionRow(
+        payment_id=payment_id,
+        revision_id=revision_id,
+        account_id=_parse_text(fields.get("account_id"), "account_id", line),
+        occurred_at=_parse_ts(fields.get("occurred_at_utc"), "occurred_at_utc", line),
+        visible_at=_parse_ts(fields.get("visible_at_utc"), "visible_at_utc", line),
+        amount_cents=amount_cents,
+        revoked=_parse_bool(fields.get("revoked"), "revoked", line),
+    )
+
+
+def _sample_row(fields: dict[str, "str | None"], line: int) -> SampleRow:
+    return SampleRow(
+        sample_id=_parse_text(fields.get("sample_id"), "sample_id", line),
+        account_id=_parse_text(fields.get("account_id"), "account_id", line),
+        prediction_at=_parse_ts(fields.get("prediction_at_utc"), "prediction_at_utc", line),
+    )
 
 
 def parse_revision_csv(text: str) -> tuple[list[RevisionRow], int]:
@@ -123,35 +196,18 @@ def parse_revision_csv(text: str) -> tuple[list[RevisionRow], int]:
     (payment_id, revision_id); identical duplicates collapse, conflicting
     duplicates reject the whole file.
     """
-    reader = _reader(text, REVISION_COLUMNS)
     rows: list[RevisionRow] = []
     seen: dict[tuple[str, int], RevisionRow] = {}
     in_file_dups = 0
-    for raw in reader:
-        line = reader.line_num
-        payment_id = _parse_text(raw.get("payment_id"), "payment_id", line)
-        revision_id = _parse_int(raw.get("revision_id", ""), "revision_id", line)
-        if revision_id < 0:
-            raise CsvError(f"line {line}: field 'revision_id' must be >= 0")
-        amount_cents = _parse_int(raw.get("amount_cents", ""), "amount_cents", line)
-        if not (_INT64_MIN <= amount_cents <= _INT64_MAX):
-            raise CsvError(f"line {line}: field 'amount_cents' out of int64 range")
-        row = RevisionRow(
-            payment_id=payment_id,
-            revision_id=revision_id,
-            account_id=_parse_text(raw.get("account_id"), "account_id", line),
-            occurred_at=_parse_ts(raw.get("occurred_at_utc", ""), "occurred_at_utc", line),
-            visible_at=_parse_ts(raw.get("visible_at_utc", ""), "visible_at_utc", line),
-            amount_cents=amount_cents,
-            revoked=_parse_bool(raw.get("revoked", ""), "revoked", line),
-        )
+    for rec in _read_records(text, REVISION_COLUMNS):
+        row = _revision_row(rec.fields, rec.line_no)
         key = (row.payment_id, row.revision_id)
         prev = seen.get(key)
         if prev is not None:
             if prev.content() != row.content():
                 raise CsvError(
-                    f"line {line}: conflicting duplicate for "
-                    f"payment_id={payment_id!r} revision_id={revision_id} "
+                    f"line {rec.line_no}: conflicting duplicate for "
+                    f"payment_id={row.payment_id!r} revision_id={row.revision_id} "
                     f"within this file"
                 )
             in_file_dups += 1
@@ -161,26 +217,33 @@ def parse_revision_csv(text: str) -> tuple[list[RevisionRow], int]:
     return rows, in_file_dups
 
 
+def parse_revision_records(text: str) -> list[RevisionRecord]:
+    """Parse every data line of a payment-revision CSV, keeping sources.
+
+    Field-format problems raise CsvError (the caller rejects the whole
+    batch). Unlike parse_revision_csv this neither deduplicates nor raises
+    on in-file key conflicts: every data line is returned so the re-upload
+    importer can reject whole payments and hand their source lines back to
+    the channel for correction.
+    """
+    return [
+        RevisionRecord(row=_revision_row(rec.fields, rec.line_no), line_no=rec.line_no, source=rec.source)
+        for rec in _read_records(text, REVISION_COLUMNS)
+    ]
+
+
 def parse_sample_csv(text: str) -> tuple[list[SampleRow], int]:
     """Parse a prediction-sample CSV. Same dedupe rules as revisions."""
-    reader = _reader(text, SAMPLE_COLUMNS)
     rows: list[SampleRow] = []
     seen: dict[str, SampleRow] = {}
     in_file_dups = 0
-    for raw in reader:
-        line = reader.line_num
-        row = SampleRow(
-            sample_id=_parse_text(raw.get("sample_id"), "sample_id", line),
-            account_id=_parse_text(raw.get("account_id"), "account_id", line),
-            prediction_at=_parse_ts(
-                raw.get("prediction_at_utc", ""), "prediction_at_utc", line
-            ),
-        )
+    for rec in _read_records(text, SAMPLE_COLUMNS):
+        row = _sample_row(rec.fields, rec.line_no)
         prev = seen.get(row.sample_id)
         if prev is not None:
             if prev.content() != row.content():
                 raise CsvError(
-                    f"line {line}: conflicting duplicate for "
+                    f"line {rec.line_no}: conflicting duplicate for "
                     f"sample_id={row.sample_id!r} within this file"
                 )
             in_file_dups += 1
